@@ -4,29 +4,21 @@ ranker.py
 This module supports ranking strategies applied after chunk retrieval.
 """
 
+import math
 from collections import defaultdict
 from typing import Dict, List, Tuple
 
-# typedef Candidate as base, we might change this into a class later
-# Each candidate is identified by its global index into `chunks`
 Candidate = int
 
 class EnsembleRanker:
-    """
-    Computes weighted reciprocal rank fusion (RRF) or weighted linear fusion of
-    normalized retriever scores.
-    ensemble_method should be one of 'linear' and 'rrf'.
-    Weights must sum to 1. Example weights: {"faiss": 0.6, "bm25": 0.4}.
-    """
     def __init__(self, ensemble_method: str, weights: Dict[str, float], rrf_k: int = 60):
         self.ensemble_method = ensemble_method.lower().strip()
         self.weights = {k: float(v) for k, v in weights.items()}
         self.rrf_k = int(rrf_k)
 
-        # Validate that weights for the provided retrievers sum to 1.0
         active_weights = sum(self.weights.values())
-        if active_weights != 1.0:
-            raise ValueError(f"Weights for active retrivers must sum to 1.0. Current sum: {active_weights}")
+        if not math.isclose(active_weights, 1.0, rel_tol=1e-6):
+            raise ValueError(f"Weights for active retrievers must sum to 1.0. Current sum: {active_weights}")
 
     def rank(self, raw_scores: Dict[str, Dict[Candidate, float]]) -> Tuple[List[int], List[float]]:
         """

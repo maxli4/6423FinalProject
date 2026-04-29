@@ -3,18 +3,7 @@ from copy import deepcopy
 
 from src.planning.planner import QueryPlanner
 
-"""
-Heuristic Query Planner
------------------------
-TODO: verify below assertions with data
-- Different query types have different needs:
-  • Definition queries → usually short answers, need fine-grained chunks (small tokens), 
-    benefit from keyword match (BM25).
-  • Explanatory queries → broader answers, need larger spans (sections), 
-    benefit from semantic similarity (FAISS).
-  • Procedural queries (how-to, steps) → benefit from wider candidate pools and tag overlap, 
-    since relevant steps may be scattered.
-"""
+
 class HeuristicQueryPlanner(QueryPlanner):
     @property
     def name(self) -> str:
@@ -45,11 +34,10 @@ class HeuristicQueryPlanner(QueryPlanner):
             cfg.ranker_weights = {"faiss": 0.7, "bm25": 0.3}
 
         elif kind == "procedural":
-            cfg.pool_size = max(cfg.pool_size, cfg.top_k * 5)
+            cfg.num_candidates = max(cfg.num_candidates, cfg.top_k * 5)
             cfg.ranker_weights = {"faiss": 0.6, "bm25": 0.4}
 
         else:
-            print("Unknown query type. Defaulting to explanatory.")
             cfg.ranker_weights = {"faiss": 0.7, "bm25": 0.3}
 
         self._log_decision(cfg)

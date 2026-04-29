@@ -5,6 +5,7 @@ import argparse
 import json
 import pathlib
 import sys
+import time
 from typing import Dict, Optional, List, Tuple, Union, Any
 
 from rich.live import Live
@@ -28,6 +29,8 @@ from src.retriever import (
     load_artifacts
 )
 from src.ranking.reranker import rerank
+from src.planning.rule_based_router import RuleBasedRouter
+from src.planning.ml_router import MLRouter
 from src.cache import get_cache
 
 ANSWER_NOT_FOUND = "I'm sorry, but I don't have enough information to answer that question."
@@ -57,6 +60,12 @@ def parse_args() -> argparse.Namespace:
         "--double_prompt",
         action="store_true",
         help="enable double prompting for higher quality answers"
+    )
+    parser.add_argument(
+        "--router",
+        choices=["none", "heuristic", "ml"],
+        default="heuristic",
+        help="query routing strategy: none (fixed config), heuristic (rule-based), ml (trained classifier)",
     )
 
     return parser.parse_args()
@@ -199,29 +208,18 @@ def get_answer(
         ranked_chunks, topk_idxs = use_indexed_chunks(question, chunks, cfg, args)
     else:
         retrieval_query = question
-        # print(f"Retrieval query: {retrieval_query}")
         if cfg.use_hyde:
             retrieval_query = generate_hypothetical_document(question, cfg.gen_model, max_tokens=cfg.hyde_max_tokens)
 
         pool_n = max(cfg.num_candidates, cfg.top_k + 10)
         raw_scores: Dict[str, Dict[int, float]] = {}
         for retriever in retrievers:
-            # print(f"Getting scores from retriever: {retriever.name}...")
-            raw_scores[retriever.name] = retriever.get_scores(retrieval_query, pool_n, chunks)
-        # TODO: Fix retrieval logging.
+            if cfg.ranker_weights.get(retriever.name, 0) > 0:
+                raw_scores[retriever.name] = retriever.get_scores(retrieval_query, pool_n, chunks)
 
-        # print("Raw scores from retrievers:")
-        # for retriever_name, score_dict in raw_scores.items():
-        #     print(f"  {retriever_name}: {list(score_dict.values())}")
-        # Step 2: Ranking
         ordered, scores = ranker.rank(raw_scores=raw_scores)
-        # print(f"Ordered candidate indices after ranking: {ordered[:cfg.top_k]}")
-        # print(f"Corresponding scores: {scores[:cfg.top_k]}")
         topk_idxs = filter_retrieved_chunks(cfg, chunks, ordered)
         ranked_chunks = [chunks[i] for i in topk_idxs]
-        # print(f"Top-{cfg.top_k} chunk indices after filtering: {topk_idxs}")
-        # print("Len Ranked chunks:", len(ranked_chunks))
-        # print("Example ranked chunk content:", ranked_chunks[0] if ranked_chunks else "No chunks retrieved")
         
         
         # Capture chunk info if in test mode
@@ -253,10 +251,7 @@ def get_answer(
                     "index_rank": index_ranks.get(idx, 0),
                 })
 
-        # Step 3: Final re-ranking
         ranked_chunks = rerank(question, ranked_chunks, mode=cfg.rerank_mode, top_n=cfg.rerank_top_k)
-        # print("Reranked Chunks", type(ranked_chunks), len(ranked_chunks), type(ranked_chunks[0]) if ranked_chunks else "No chunks")
-        # print("Example reranked chunk content:", ranked_chunks[0] if ranked_chunks else "No chunks after reranking")
 
     if not ranked_chunks and not cfg.disable_chunks:
         if console:
@@ -392,12 +387,23 @@ def run_chat_session(args: argparse.Namespace, cfg: RAGConfig):
         print(f"ERROR: {e}. Run 'index' mode first.")
         sys.exit(1)
 
+    # Initialize router
+    router_type = getattr(args, "router", "none")
+    router = None
+    if router_type == "heuristic":
+        router = RuleBasedRouter(cfg)
+        print(f"Query router: RuleBasedRouter")
+    elif router_type == "ml":
+        router = MLRouter(cfg)
+        print(f"Query router: MLRouter")
+    else:
+        print("Query router: disabled (fixed config)")
+
     chat_history = []
     additional_log_info = {}
     print("Initialization complete. You can start asking questions!")
     print("Type 'exit' or 'quit' to end the session.")
     while True:
-        print("CHAT HISTORY:", chat_history)  # Debug print to trace chat history
         try:
             q = input("\nAsk > ").strip()
             if not q:
@@ -405,7 +411,7 @@ def run_chat_session(args: argparse.Namespace, cfg: RAGConfig):
             if q.lower() in {"exit", "quit"}:
                 print("Goodbye!")
                 break
-            
+
             effective_q = q
             if cfg.enable_history and chat_history:
                 try:
@@ -414,13 +420,29 @@ def run_chat_session(args: argparse.Namespace, cfg: RAGConfig):
                     additional_log_info["contextualized_query"] = effective_q
                     additional_log_info["original_query"] = q
                     additional_log_info["chat_history"] = chat_history
-                    print(f"Contextualized Query: {effective_q}")  # Debug print to trace contextualization
                 except Exception as e:
                     print(f"Warning: Failed to contextualize query: {e}. Using original query.")
                     effective_q = q
-            
+
+            # Apply per-query routing: swap the ranker in artifacts if router is active
+            if router is not None:
+                _t0 = time.perf_counter()
+                query_cfg = router.plan(effective_q)
+                router_ms = (time.perf_counter() - _t0) * 1000
+                print(f"[Router] overhead: {router_ms:.2f}ms")
+                additional_log_info["router_type"] = router.name
+                additional_log_info["router_overhead_ms"] = router_ms
+                per_query_ranker = EnsembleRanker(
+                    ensemble_method=query_cfg.ensemble_method,
+                    weights=query_cfg.ranker_weights,
+                    rrf_k=int(query_cfg.rrf_k),
+                )
+                artifacts["ranker"] = per_query_ranker
+            else:
+                query_cfg = cfg
+
             # Use the single query function. get_answer also renders the streaming markdown and takes care of logging, so we need not do anything else here.
-            ans = get_answer(effective_q, cfg, args, logger, console, artifacts=artifacts, additional_log_info=additional_log_info)
+            ans = get_answer(effective_q, query_cfg, args, logger, console, artifacts=artifacts, additional_log_info=additional_log_info)
 
             # Update Chat history (make it atomic for user + assistant turn)
             try:
